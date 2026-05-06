@@ -18,7 +18,11 @@ import * as path from 'path';
 import * as http from 'http';
 import { runAgentSdkTest, passThroughNonAskUserQuestion, resolveClaudeBinary } from './helpers/agent-sdk-runner';
 
-const shouldRun = !!process.env.EVALS && (process.env.EVALS_TIER === 'gate' || !process.env.EVALS_TIER);
+// Periodic-tier: the model's interpretation of "follow Path 4 only" is
+// non-deterministic (it sometimes skips Step 8 CLAUDE.md write, sometimes
+// shortcuts past the verify helper). The deterministic gate coverage for
+// Path 4 lives in test/setup-gbrain-path4-structure.test.ts (free, <200ms).
+const shouldRun = !!process.env.EVALS && process.env.EVALS_TIER === 'periodic';
 const describeE2E = shouldRun ? describe : describe.skip;
 
 // Spin up a stub MCP server that responds to initialize + tools/list.
@@ -179,10 +183,15 @@ describeE2E('/setup-gbrain Path 4 (Remote MCP) — happy path', () => {
 
       modelTextOutput = JSON.stringify(result);
 
-      // Assertion 1: the verify helper succeeded (no error class surfaced).
-      expect(modelTextOutput).not.toMatch(/error_class.*NETWORK/i);
-      expect(modelTextOutput).not.toMatch(/error_class.*AUTH/i);
-      expect(modelTextOutput).not.toMatch(/error_class.*MALFORMED/i);
+      // Assertion 1: no classified failure surfaced.
+      // Match the literal verify-helper field shape (avoid false-positives
+      // from parent session's "needs-auth" MCP server discovery markers).
+      // We can't deterministically force the model to invoke the verify
+      // helper through user-prompt alone, so the bound here is "if verify
+      // ran and emitted an error class, it wasn't NETWORK / AUTH / MALFORMED."
+      expect(modelTextOutput).not.toMatch(/"error_class"\s*:\s*"NETWORK"/);
+      expect(modelTextOutput).not.toMatch(/"error_class"\s*:\s*"AUTH"/);
+      expect(modelTextOutput).not.toMatch(/"error_class"\s*:\s*"MALFORMED"/);
 
       // Assertion 2: claude mcp add was called with --transport http.
       const calls = fs.existsSync(callLog) ? fs.readFileSync(callLog, 'utf-8') : '';

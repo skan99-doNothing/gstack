@@ -15,7 +15,9 @@ import * as path from 'path';
 import * as http from 'http';
 import { runAgentSdkTest, passThroughNonAskUserQuestion, resolveClaudeBinary } from './helpers/agent-sdk-runner';
 
-const shouldRun = !!process.env.EVALS && (process.env.EVALS_TIER === 'gate' || !process.env.EVALS_TIER);
+// Periodic-tier (companion to skill-e2e-setup-gbrain-remote.test.ts).
+// Deterministic gate coverage lives in setup-gbrain-path4-structure.test.ts.
+const shouldRun = !!process.env.EVALS && process.env.EVALS_TIER === 'periodic';
 const describeE2E = shouldRun ? describe : describe.skip;
 
 function startStub401(): Promise<{ url: string; close: () => Promise<void> }> {

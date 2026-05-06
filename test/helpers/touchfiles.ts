@@ -434,11 +434,15 @@ export const E2E_TIERS: Record<string, 'gate' | 'periodic'> = {
   // costs ~$0.30-$0.50 per run, not needed on every commit)
   'brain-privacy-gate': 'periodic',
 
-  // /setup-gbrain Path 4 (Remote MCP) — gate-tier. Stub HTTP server is
-  // deterministic; Path 4's STOP gates are the failure mode this catches
-  // (token in CLAUDE.md, partial registration on bad bearer).
-  'setup-gbrain-remote': 'gate',
-  'setup-gbrain-bad-token': 'gate',
+  // /setup-gbrain Path 4 (Remote MCP) — periodic-tier. The stub HTTP
+  // server is deterministic but the model's interpretation of "follow
+  // Path 4 only" is not — assertions on which steps the model ran are
+  // flaky. The deterministic gate-tier coverage for Path 4 lives in
+  // test/setup-gbrain-path4-structure.test.ts (free, <200ms). These
+  // E2E tests stay available for on-demand verification of the live
+  // model's behavior against a stub MCP server.
+  'setup-gbrain-remote': 'periodic',
+  'setup-gbrain-bad-token': 'periodic',
 
   // AskUserQuestion format regression — periodic (Opus 4.7 non-deterministic benchmark)
   'plan-ceo-review-format-mode': 'periodic',
