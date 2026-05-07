@@ -230,24 +230,30 @@ export async function writeLlmsTxt(opts: GenerateOptions & { outputPath?: string
 }
 
 // ─── CLI entry ──────────────────────────────────────────────
+// Wrapped in an IIFE so top-level await doesn't make this module async-by-
+// import (which would break require() consumers like
+// test/gen-skill-docs.test.ts that pull writeLlmsTxt indirectly via
+// gen-skill-docs).
 if (import.meta.main) {
-  const strict = process.argv.includes('--strict');
-  const dryRun = process.argv.includes('--dry-run');
-  const result = dryRun
-    ? await generateLlmsTxt({ strict })
-    : await writeLlmsTxt({ strict });
+  void (async () => {
+    const strict = process.argv.includes('--strict');
+    const dryRun = process.argv.includes('--dry-run');
+    const result = dryRun
+      ? await generateLlmsTxt({ strict })
+      : await writeLlmsTxt({ strict });
 
-  for (const w of result.warnings) console.error(`[gen-llms-txt] WARN: ${w}`);
+    for (const w of result.warnings) console.error(`[gen-llms-txt] WARN: ${w}`);
 
-  if (dryRun) {
-    const existing = fs.existsSync(OUTPUT) ? fs.readFileSync(OUTPUT, 'utf-8') : '';
-    if (existing !== result.content) {
-      console.error('[gen-llms-txt] OUT OF DATE — run `bun run gen:skill-docs` to regenerate gstack/llms.txt');
-      process.exit(1);
+    if (dryRun) {
+      const existing = fs.existsSync(OUTPUT) ? fs.readFileSync(OUTPUT, 'utf-8') : '';
+      if (existing !== result.content) {
+        console.error('[gen-llms-txt] OUT OF DATE — run `bun run gen:skill-docs` to regenerate gstack/llms.txt');
+        process.exit(1);
+      }
+      console.log('[gen-llms-txt] up to date');
+    } else {
+      console.log(`[gen-llms-txt] wrote ${OUTPUT}`);
+      console.log(`[gen-llms-txt]   skills=${result.skills.length} browse=${result.browseCommands.length} design=${result.designCommands.length}`);
     }
-    console.log('[gen-llms-txt] up to date');
-  } else {
-    console.log(`[gen-llms-txt] wrote ${OUTPUT}`);
-    console.log(`[gen-llms-txt]   skills=${result.skills.length} browse=${result.browseCommands.length} design=${result.designCommands.length}`);
-  }
+  })();
 }
