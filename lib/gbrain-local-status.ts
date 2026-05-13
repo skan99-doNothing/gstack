@@ -91,34 +91,50 @@ function hashPath(p: string): string {
 
 /**
  * Resolve the absolute path of `gbrain` on PATH. Returns null when missing.
- * Uses `command -v` semantics via execFileSync.
+ * Memoized per-process keyed on PATH so detect's call and the classifier's
+ * call share one fork-exec (~200ms saved per skill preamble).
  */
-function resolveGbrainBin(env?: NodeJS.ProcessEnv): string | null {
+const _gbrainBinCache = new Map<string, string | null>();
+export function resolveGbrainBin(env?: NodeJS.ProcessEnv): string | null {
+  const e = env ?? process.env;
+  const key = e.PATH || "";
+  if (_gbrainBinCache.has(key)) return _gbrainBinCache.get(key)!;
+  let result: string | null = null;
   try {
     const out = execFileSync("sh", ["-c", "command -v gbrain"], {
       encoding: "utf-8",
       timeout: 2_000,
       stdio: ["ignore", "pipe", "ignore"],
-      env: env ?? process.env,
+      env: e,
     });
-    return out.trim() || null;
+    result = out.trim() || null;
   } catch {
-    return null;
+    result = null;
   }
+  _gbrainBinCache.set(key, result);
+  return result;
 }
 
-function readGbrainVersion(env?: NodeJS.ProcessEnv): string {
+/** Memoized per-process. */
+const _gbrainVersionCache = new Map<string, string>();
+export function readGbrainVersion(env?: NodeJS.ProcessEnv): string {
+  const e = env ?? process.env;
+  const key = `${e.PATH || ""}|${resolveGbrainBin(e) || ""}`;
+  if (_gbrainVersionCache.has(key)) return _gbrainVersionCache.get(key)!;
+  let result = "";
   try {
     const out = execFileSync("gbrain", ["--version"], {
       encoding: "utf-8",
       timeout: 2_000,
       stdio: ["ignore", "pipe", "ignore"],
-      env: env ?? process.env,
+      env: e,
     });
-    return out.trim().split("\n")[0] || "";
+    result = out.trim().split("\n")[0] || "";
   } catch {
-    return "";
+    result = "";
   }
+  _gbrainVersionCache.set(key, result);
+  return result;
 }
 
 function configFingerprint(): { mtime: number; size: number } {

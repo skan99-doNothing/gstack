@@ -37,7 +37,11 @@ import { existsSync, readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
-import { localEngineStatus } from "../lib/gbrain-local-status";
+import {
+  localEngineStatus,
+  resolveGbrainBin,
+  readGbrainVersion,
+} from "../lib/gbrain-local-status";
 
 const STATE_DIR = process.env.GSTACK_HOME || join(userHome(), ".gstack");
 const SCRIPT_DIR = __dirname;
@@ -71,10 +75,12 @@ function tryReadJSON(path: string): unknown | null {
 }
 
 // --- gbrain binary presence + version ---
+// Uses the shared memoized resolvers from lib/gbrain-local-status.ts so
+// detect and the classifier share probe results within one process.
 function detectGbrain(): { onPath: boolean; version: string | null } {
-  const out = tryExec("sh", ["-c", "command -v gbrain"], 2_000);
-  if (!out) return { onPath: false, version: null };
-  const verRaw = tryExec("gbrain", ["--version"], 2_000);
+  const bin = resolveGbrainBin();
+  if (!bin) return { onPath: false, version: null };
+  const verRaw = readGbrainVersion();
   if (!verRaw) return { onPath: true, version: null };
   // Match bash behavior: head -1 | tr -d '[:space:]'
   const version = verRaw.split("\n")[0].replace(/\s+/g, "") || null;
@@ -93,9 +99,13 @@ function detectConfig(): { exists: boolean; engine: "pglite" | "postgres" | null
 }
 
 // --- gbrain doctor health (any nonzero exit or non-"ok"/"warnings" status → false) ---
+//
+// Uses --fast to avoid hanging on a dead DB. Per the local-status classifier
+// (which probes DB directly via `gbrain sources list`), gbrain_doctor_ok is a
+// coarse health summary, not engine-reachability — that's gbrain_local_status.
 function detectDoctor(onPath: boolean): boolean {
   if (!onPath) return false;
-  const out = tryExec("gbrain", ["doctor", "--json"], 5_000);
+  const out = tryExec("gbrain", ["doctor", "--json", "--fast"], 3_000);
   if (!out) return false;
   try {
     const parsed = JSON.parse(out) as { status?: string };
