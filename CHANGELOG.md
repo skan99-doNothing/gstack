@@ -1,5 +1,204 @@
 # Changelog
 
+## [1.40.0.2] - 2026-05-20
+
+## **Cmd+Q on the browser actually means quit. Process supervisors stop respawning on user-initiated close.**
+## **Chromium exit code is read for what it is: 0 = user wanted this, non-zero = real crash.**
+
+Every browse-server `browser.on('disconnected')` handler exited with a non-zero code regardless of why Chromium left. Process supervisors (gbrowser's gbd HealthMonitor) consumed that as a crash signal and respawned the whole stack on exponential backoff, so a user who Cmd+Q'd the visible browser saw a fresh window pop back 1s later, then 2s, then 4s. The fix reads the underlying ChildProcess's exit code at disconnect time: code 0 + no signal means the user closed Chromium cleanly, anything else means it crashed. We then exit 0 on clean and preserve the legacy per-path code on crash (launch→1, launchHeaded→2, handoff→1). Process supervisors get the signal they were always missing: 0 = "user wanted this, leave it alone"; non-zero = "please bring me back."
+
+### The numbers that matter
+
+Source: `bun test browse/test/browser-manager-unit.test.ts` ... 9 tests across the cause-resolver, all green.
+
+| Surface | Before | After |
+|---|---|---|
+| macOS Cmd+Q on browse-server-managed Chromium | Server exits 1 (or 2 for headed) → supervisor sees crash → respawns with 1s→2s→4s→8s→16s backoff | Server exits 0 → supervisor treats as user intent → does not respawn |
+| Chromium genuinely crashes (SIGSEGV, OOM) | Server exits 1 → respawn | Server exits 1 → respawn (preserved) |
+| Headed Chromium hard-killed (SIGKILL) | Server exits 2 → respawn | Server exits 2 → respawn (preserved) |
+| `handoff()` browser closed during a session | Server exits 1 → respawn | Same clean-vs-crash discrimination as `launch()` |
+| Disconnect handlers | 3 sites, each rolling its own exit logic | 1 helper (`resolveDisconnectCause`) consumed at all 3 sites |
+
+### What this means for builders
+
+If you Cmd+Q a browse-server-managed Chromium window, the window stays gone. The CLI process exits cleanly. Process supervisors leave it alone. The crash-recovery path (Chromium dying mid-task to SIGSEGV / SIGKILL / OOM) still works exactly the same: non-zero exit, supervisor respawns. Reconnect any time with `$B connect` or by re-running your gbd. Pull and your next Cmd+Q is final.
+
+### Itemized changes
+
+#### Added
+
+- `browse/src/browser-manager.ts` (new exports) — `resolveDisconnectCause(browser)` reads the Playwright `Browser.process()` ChildProcess exit code + signal code, returns `'clean'` (exit 0, no signal) or `'crash'` (anything else). Waits up to 1s for the exit if `'disconnected'` fires before the child has fully exited. `handleChromiumDisconnect(browser)` is the headless `launch()` site's one-line dispatcher that consumes the resolver and exits 0 or 1 accordingly.
+- `browse/test/browser-manager-unit.test.ts` — seven new tests pinning the resolver across already-exited / signal-killed / async-exit / null-browser inputs.
+
+#### Fixed
+
+- `browse/src/browser-manager.ts` `launch()` disconnect handler — now exits 0 on clean user-quit, 1 on crash. Previously always exited 1.
+- `browse/src/browser-manager.ts` `launchHeaded()` disconnect handler — clean user-quit exits 0; crash preserves the legacy code 2 so existing supervisors that distinguish "headed crash" from "headless crash" continue to work. `onDisconnect()` cleanup callback fires in both cases.
+- `browse/src/browser-manager.ts` `handoff()` disconnect handler — same clean-vs-crash discrimination via the shared helper so a Cmd+Q after a headless→headed handoff doesn't trigger respawn either.
+
+## [1.40.0.0] - 2026-05-16
+
+## **gbrain sync stops biting users across the install path, slug algorithm, federation queue, and `.env.local` footgun.**
+## **Eight community-filed bugs land as one consolidated wave with a centralized spawn surface and an upgrade migration that actually reaches existing installs.**
+
+The eight highest-volume gbrain-sync bugs in the backlog ship as one consolidated release. Conductor sibling worktrees stop stomping each other's per-worktree pin because `.gbrain-source` now lands in the consumer repo's `.gitignore` on every successful sync. Cross-machine federation stops colliding because the source-id hash folds hostname into its key — and existing users get a migration path that renames in place when gbrain supports it, falls back to register-new-then-remove-old when not. Slugs stop truncating mid-word (`skill` → `kill`). `DATABASE_URL` no longer leaks from a host project's `.env.local` into gbrain's auth, at both the parent `gstack-gbrain-sync` and the `gstack-memory-ingest` grandchild. The brain-allowlist finally picks up `/plan-eng-review` test plans alongside `/office-hours` design docs from v1.38.1.0 — with an idempotent migration that runs on top of v1.38.1.0's done-marker so existing users aren't orphaned. The gbrain probe stops shelling through a bash builtin. Windows MSYS/MINGW installs stop crashing on bun postinstall, with a post-install subcommand probe that flags missing native artifacts before they bite at sync time.
+
+### The numbers that matter
+
+Source: `bun test test/gstack-gbrain-sync.test.ts test/build-gbrain-env.test.ts test/gbrain-exec-invariant.test.ts test/gbrain-source-gitignore.test.ts test/artifacts-init-migration.test.ts test/gstack-memory-ingest.test.ts` — 100+ unit tests, all green.
+
+| Surface | Before | After |
+|---|---|---|
+| `/sync-gbrain` inside a Next.js / Prisma / Rails project with `DATABASE_URL` in `.env.local` | Code stage crashes with "source registration failed: gbrain not configured"; memory stage crashes with "password authentication failed for user 'postgres'"; only brain-sync git push survives | All three stages run. Parent process AND the bun grandchild that runs `gbrain import` both see DATABASE_URL seeded from gbrain's own config |
+| Two machines with identical home-dir layouts (chezmoi, ansible) syncing a shared brain | Same source id collides; last-writer-wins on `local_path`; loser's queries return cryptic "Not a git repository" errors | Distinct source ids (`sha1("${hostname}::${path}")`). Existing users with the path-only-hash form get rename-in-place (preserves pages) when gbrain supports `sources rename`, or register-new-then-remove-old after sync verifies (no data-loss window) when it doesn't |
+| Conductor sibling worktrees of the same repo | `.gbrain-source` gets committed in worktree A, clobbers worktree B's pin on next `git pull`, semantic search routes to the wrong source | `.gbrain-source` now lands in the consumer repo's `.gitignore` on every successful sync. Idempotent re-runs |
+| `gstack-code-drummerms-av-sow-wiz-skill-270c0001` (long repo name forced truncation) | `gstack-code-kill-270c0001-c32152` (mid-word cut from `skill` → `kill`) | `gstack-code-270c0001-050d83` (whole-token cut on hyphen boundaries; `repo-only-hostpathhash` retry when org prefix forces overflow) |
+| `https://github.com/foo/bar.git` HTTPS remote (#1357) | Slugs could carry through periods, failing gbrain's 1-32 alnum-hyphen validator | Period-free slugs guaranteed; explicit regression test pinned at `test/gstack-gbrain-sync.test.ts` |
+| Federation sync allowlist (existing user upgrading from v1.38.1.0) | `projects/*/*-eng-review-test-plan-*.md` orphaned by v1.38.1.0's done-marker; `/plan-eng-review` test plans silently dropped | v1.40.0.0 migration idempotently patches `.brain-allowlist`, `.brain-privacy-map.json`, `.gitattributes` on top of v1.38.1.0 state |
+| `bun install` for gbrain on Windows MSYS / MINGW / Git Bash | Postinstall script aborts with non-zero exit; `gstack-gbrain-install` fails the whole flow | `--ignore-scripts` on Windows shells; post-install probe of `gbrain sources --help` flags any missing native artifacts before they bite at sync time |
+| Spawning `gbrain` from gstack | 17+ direct `spawnSync("gbrain"`/`spawn("gbrain"`/`execFileSync("gbrain"` sites across the codebase, each one a missed-env-threading risk | Two hot-path files (`bin/gstack-gbrain-sync.ts`, `bin/gstack-memory-ingest.ts`) route every gbrain spawn through `lib/gbrain-exec.ts`. Static-source invariant test fails the build on direct call sites |
+
+### What this means for builders
+
+If you `/sync-gbrain` inside a framework project (Next.js, Prisma, Rails, etc.), the code AND memory stages now work — no more sourcing `~/.zshrc` first or unsetting `DATABASE_URL`. If you sync across multiple machines (chezmoi-managed dotfiles, ansible-provisioned VMs), your source ids stay distinct and your upgrade either renames pages in place or re-indexes once and cleans up the orphan. If you run Conductor sibling worktrees, your `.gbrain-source` pin stops accidentally committing. If you ship long repo names, slugs read cleanly. Run `/gstack-upgrade` to pick up the brain-allowlist migration; everything else is automatic on next sync.
+
+### Itemized changes
+
+#### Added
+
+- `lib/gbrain-exec.ts` (new, ~175 lines) — single source of truth for gbrain CLI invocation. `buildGbrainEnv` seeds DATABASE_URL from `${GBRAIN_HOME:-$HOME/.gbrain}/config.json`, with `GSTACK_RESPECT_ENV_DATABASE_URL=1` opt-out for the rare case where the brain intentionally lives in the project's local DB. `spawnGbrain` / `execGbrainJson` / `execGbrainText` / `spawnGbrainAsync` wrappers always inject the seeded env. Returns a fresh env object every call (no mutable identity leak).
+- `bin/gstack-gbrain-sync.ts`: `derivePathOnlyHashLegacyId`, `gbrainSupportsSourcesRename` (exact-command feature check), `sourceLocalPath`, `planHostnameFoldMigration`, `removeOrphanedSource`. Hostname-fold migration: detect old form → probe path-drift → rename in place (if supported) → fall back to register-new + sync-OK + remove-old.
+- `gstack-upgrade/migrations/v1.40.0.0.sh` — idempotent jq-based migration for `.brain-allowlist`, `.brain-privacy-map.json`, `.gitattributes` to add `projects/*/*-eng-review-test-plan-*.md`. Targeted in-place repair; never `git commit + push`.
+- `test/build-gbrain-env.test.ts` (10 tests) — covers seed/override/escape-hatch/missing/unparseable/no-database_url/GBRAIN_HOME/object-identity/preservation/idempotent-when-matches.
+- `test/gbrain-exec-invariant.test.ts` (2 tests) — static-source check that fails the build if `bin/gstack-gbrain-sync.ts` or `bin/gstack-memory-ingest.ts` adds a direct gbrain spawn outside the helper.
+- `test/gbrain-source-gitignore.test.ts` (6 tests) — covers create / append / idempotent / whitespace / read-only checkout.
+- `test/gstack-gbrain-sync.test.ts` — 15+ new tests for migration paths, path-drift, hyphen-boundary truncation, HTTPS slug period regression (#1357), and the centralized helper plumbing.
+- `test/artifacts-init-migration.test.ts` — 5 new tests for v1.40.0.0 migration on top of installed v1.38.1.0 state.
+
+#### Changed
+
+- `bin/gstack-gbrain-sync.ts` — `deriveCodeSourceId` folds hostname into the pathhash AND retries with `repo-only-hostpathhash` when the full slug forces truncation. `constrainSourceId` cuts on hyphen boundaries (no more mid-word `skill` → `kill`). `runCodeImport` now runs the hostname-fold migration after the v1.x legacy cleanup, threads the seeded env through every gbrain spawn, and defers the orphan-source removal until AFTER sync verifies pages exist (closes the data-loss window codex review #2 flagged). `ensureGbrainSourceGitignored` appends `.gbrain-source` to the consumer repo's `.gitignore` after a successful attach. `if (import.meta.main)` guard added so the file is importable for unit tests.
+- `bin/gstack-memory-ingest.ts` — routes `gbrain --help` probe and `gbrain import` streaming spawn through the helper. The bun grandchild now inherits a seeded env from `gstack-gbrain-sync`; defense-in-depth seeding inside memory-ingest itself for standalone invocations.
+- `bin/gstack-artifacts-init` — adds `projects/*/*-eng-review-test-plan-*.md` to `.brain-allowlist`, `.brain-privacy-map.json` (class `artifact`), and `.gitattributes` (`merge=union`).
+- `bin/gstack-gbrain-install` — Windows MSYS/MINGW/Cygwin shells get `bun install --ignore-scripts`. Post-install probe of `gbrain sources --help` flags missing native artifacts with a clear Windows-specific remediation message.
+- `lib/gbrain-sources.ts` — `gbrain sources list --json` timeout bumped 10s → 30s for slow Supabase round-trips.
+- `lib/gbrain-local-status.ts` — `gbrain --version` and `gbrain sources list --json` probes use `spawnSync` directly (no `command -v` shelling).
+
+#### Fixed
+
+- Hostname-fold migration data-loss window (codex review #2): the previous "register new, remove old" sequence could wipe pages if the new-source sync failed mid-flight. Now: register new → sync exits 0 → page_count > 0 → only THEN remove old.
+- Hostname-fold path-drift (codex review #3): if the old source's `local_path` differs from the current repo root (user moved the repo, or two machines share a hash slot), migration is skipped with a clear warning instead of blindly renaming/removing the wrong source.
+- `.gbrain-source` per-worktree pin breaking on commit (#1384): four contributors independently submitted fixes for this bug. PR #1521's exported-helper shape was selected; PR #1501 and PR #1464 closed as superseded.
+- Cross-machine source-id collision when two hosts share a path layout (#1414).
+- Mid-word slug truncation when long repo names force the 32-char cap.
+- HTTPS-with-`.git` remotes producing period-laden source ids (#1357) — closed with explicit regression test.
+- Federation queue dropping `/plan-eng-review` test plans on existing installs (#1452 follow-on).
+- gbrain CLI probe failing on Windows shells where `command -v` is not a real binary (#1386 — partial; Windows ingest at scale remains separate work).
+- `bun install` aborting on Windows MSYS/MINGW shells during gbrain installation (#1271 follow-on).
+
+#### NOT fixed by this wave (deferred; carry-overs for the next gbrain wave)
+
+- #1346 — `gstack-memory-ingest` calls `put_page` on gbrain ≥0.18 which renamed the subcommand. This wave routes the probe and stream through `lib/gbrain-exec.ts` but does NOT change the `put_page` call shape. Users on gbrain ≥0.18 still see memory ingest break with "unknown subcommand: put_page" — a separate API adapter pass owns that fix.
+- #1435 — PgBouncer transaction-mode pooler breaks the `/sync-gbrain` capability check. v1.40.0.0's timeout bump (10s → 30s) is partial mitigation, not a fix. Needs pooler-mode detection.
+- #1301 — `/setup-gbrain` picks port 6543 (transaction pooler) but new Supabase projects only listen on 5432 (session pooler). Provisioning-logic change.
+- #1348 — `gstack-brain-init` defaults to SSH remote, fails for HTTPS-configured `gh`. Init-logic change.
+
+#### For contributors
+
+- Every new gbrain spawn from `bin/gstack-gbrain-sync.ts` or `bin/gstack-memory-ingest.ts` MUST go through `lib/gbrain-exec.ts`'s `spawnGbrain` / `execGbrainJson` / `execGbrainText` / `spawnGbrainAsync`. The invariant test `test/gbrain-exec-invariant.test.ts` fails the build on direct call sites. This guards against silently regressing the DATABASE_URL fix when a future contributor adds a quick `spawnSync("gbrain", ...)` without env threading.
+- `GSTACK_RESPECT_ENV_DATABASE_URL=1` is the documented escape hatch when the brain intentionally lives in the project's local DB (e.g., a developer running a personal brain pointed at the same Postgres their Next.js app uses). The default is "seed from gbrain's config, override the caller's `.env.local`."
+- The hostname-fold migration ships in `bin/gstack-gbrain-sync.ts` itself, not as a separate `gstack-upgrade/migrations/v1.40.0.0.sh` step. The trigger is "first sync after upgrade," not "migration runner sweep." It's idempotent — repeat invocations are no-ops because the legacy id either gets renamed/removed on the first run or path-drift skip persists across runs.
+- The wave is credited per commit: 0xDevNinja (hostname fold #1468), drummerms (hyphen-boundary cut #1481), Jayesh Betala (probe CLI #1485), Jason Shultz (DATABASE_URL seeding #1508 + timeout #1507), genisis0x (consumer gitignore #1521, allowlist eng-review pattern #1465, Windows postinstall #1487). NikhileshNanduri (#1501) and realcarsonterry (#1464) submitted independent fixes for the gitignore bug — credited in conversation but not in commits (one canonical implementation landed). Thank you.
+
+## [1.39.2.0] - 2026-05-15
+
+## **Conductor workspaces wire `GSTACK_*` keys straight into gbrain embeddings and paid evals.**
+## **No more sourcing keys from your shell before every paid run.**
+
+Conductor explicitly strips `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` from every workspace's process env, so `.env` copies and `~/.zshrc` exports never reach gbrain's embedding pipeline or `@anthropic-ai/claude-agent-sdk`. The fix path is `GSTACK_ANTHROPIC_API_KEY` / `GSTACK_OPENAI_API_KEY` — Conductor passes those through untouched. The new `lib/conductor-env-shim.ts` closes the loop on the gstack side: it promotes the prefixed form to canonical when canonical is empty. Four TS entry points import the shim as a side effect (`gstack-gbrain-sync.ts`, `gstack-model-benchmark`, `preflight-agent-sdk.ts`, `e2e-helpers.ts`). `README.md`, `USING_GBRAIN_WITH_GSTACK.md`, and `CONTRIBUTING.md` document the pattern, plus the checklist for adding the import to new entry points.
+
+### The numbers that matter
+
+Source: working-tree verification before commit. Three observable scenarios in a fresh Conductor workspace with only `GSTACK_OPENAI_API_KEY` and `GSTACK_ANTHROPIC_API_KEY` in env.
+
+| Surface | Before | After |
+|---|---|---|
+| `/sync-gbrain` embeddings | 50+ lines of `[gbrain] embedding failed for code file ...: OpenAI embedding requires OPENAI_API_KEY`; pages indexed structurally but semantic search degrades to BM25 | 3294 chunks embedded; `gbrain search "browser security canary token"` returns ranked code regions at 0.95 top score |
+| `bun run test:evals` | `ANTHROPIC_API_KEY not set, judge requires Anthropic access` from `test/helpers/benchmark-judge.ts:15` before any test runs | Shim promotes at module import; paid evals proceed normally |
+| Adding a new paid-API entry point | Manual env mapping every invocation, or every new entry point ships broken inside Conductor | One import line: `import "../lib/conductor-env-shim";` at the top of the file |
+
+### What this means for Conductor users
+
+If you run gstack inside Conductor, `/sync-gbrain` embeddings, paid evals, and the agent SDK just work without sourcing keys from your shell. The shim is 15 lines, side-effect-only, and the import is one line per consumer. The new "Conductor + GSTACK_* env vars" section in `USING_GBRAIN_WITH_GSTACK.md` and the updated "Conductor workspaces" block in `CONTRIBUTING.md` cover the pattern so you don't have to reverse-engineer it from a stack trace.
+
+### Itemized changes
+
+#### Added
+
+- `lib/conductor-env-shim.ts` (new, 15 lines) — side-effect IIFE that promotes `GSTACK_FOO_API_KEY` to `FOO_API_KEY` when the canonical name is empty. Currently covers `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`.
+- `USING_GBRAIN_WITH_GSTACK.md` "What you get after setup" section — semantic code search + cross-session memory framed as concrete capabilities.
+- `USING_GBRAIN_WITH_GSTACK.md` Path 4 (remote gbrain MCP / split-engine) section — covers brain-via-remote-MCP + code-via-local-PGLite, the two engines being independent, when to pick this path.
+- `USING_GBRAIN_WITH_GSTACK.md` `/sync-gbrain` workflow section — three stages (code, memory, brain-sync), pre-flight gating on local engine health, watermark + `--skip-failed` mechanics, capability check governing the CLAUDE.md guidance block.
+- `USING_GBRAIN_WITH_GSTACK.md` "Conductor + GSTACK_* env vars" section — explains the prefix pattern, lists the four entry points that import the shim, points contributors at `CONTRIBUTING.md`.
+- `USING_GBRAIN_WITH_GSTACK.md` troubleshooting entries: "`/sync-gbrain` reports OK but `gbrain search` returns nothing semantic" (embeddings failed silently) and "`gbrain sync` blocked at a commit hash, `FILE_TOO_LARGE`" (5 MB hard limit, fix via `--skip-failed`).
+
+#### Changed
+
+- `bin/gstack-gbrain-sync.ts`, `bin/gstack-model-benchmark`, `scripts/preflight-agent-sdk.ts`, `test/helpers/e2e-helpers.ts` — added `import "../lib/conductor-env-shim";` at the top of each. One line each, side-effect-only.
+- `USING_GBRAIN_WITH_GSTACK.md` "three paths" → "four paths" header now that Path 4 (remote MCP) is documented as a first-class choice.
+- `USING_GBRAIN_WITH_GSTACK.md` environment variables table — added rows for `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GSTACK_OPENAI_API_KEY`, `GSTACK_ANTHROPIC_API_KEY` covering what reads each one and the GSTACK_-prefix fallback.
+- `CONTRIBUTING.md` "Conductor workspaces" — new paragraph documenting the `GSTACK_*` prefix injection pattern, the shim file, and the four entry points that already import it.
+
+#### For contributors
+
+- New TS entry points that hit Anthropic or OpenAI APIs (paid evals, `claude-agent-sdk`, gbrain embeddings, model benchmarks) should add `import "../lib/conductor-env-shim";` as the first import. Without it, the entry point ships broken inside Conductor even though it works in a bare shell. The contributor checklist in `CONTRIBUTING.md`'s "Conductor workspaces" block names the four entry points already wired up.
+
+## [1.39.1.0] - 2026-05-15
+
+## **Plan-mode reviews now enforce a blocking ExitPlanMode gate.**
+## **The review report can no longer go missing without breaking the contract.**
+
+`/plan-eng-review`, `/plan-ceo-review`, `/plan-design-review`, `/plan-devex-review`, and `/codex review` now end with an EXIT PLAN MODE GATE (BLOCKING) section. Before calling ExitPlanMode, the model runs a four-item checklist: read the plan file, confirm the last `## ` heading is `## GSTACK REVIEW REPORT`, verify the report has a Runs/Status/Findings table + VERDICT line, and confirm `gstack-review-log` + `gstack-review-read` ran. Failing the checklist and exiting plan mode anyway is framed as a contract violation, not a soft permission to defer. The structural property ("review report is the file's terminal heading") is what makes the gate immune to "I wrote some review prose into the plan body" self-deception. A regression test in `test/gen-skill-docs.test.ts` strips fenced code blocks and asserts the gate is the terminal `## ` heading in all four plan-* review SKILL.md files.
+
+### The numbers that matter
+
+Source: `bun test test/gen-skill-docs.test.ts` — 389 cases, all green in ~1.5s. Manual verification via `awk` confirms the gate is the LAST `## ` heading in the regenerated SKILL.md for each plan-* review skill, and present mid-file in codex's Step 2A (where it's review-mode-scoped per design).
+
+| Surface | Before | After |
+|---|---|---|
+| ExitPlanMode discipline in plan-* reviews | Soft `## Plan Status Footer` injected at TOP of skill via preamble: "if the plan file lacks `## GSTACK REVIEW REPORT`, run `gstack-review-read` and append... PLAN MODE EXCEPTION — always allowed." Permission grant, not a precondition. Sat ~3000 lines above ExitPlanMode in the skill prompt. | Terminal `## EXIT PLAN MODE GATE (BLOCKING)` injected at EOF of every plan-* review skill: 4-item self-check with explicit "contract violation" framing for the failure mode. Last thing the model reads before ExitPlanMode. |
+| Preamble footer in operational skills (`/ship`, `/qa`, `/review`, `/health`) | Same enforcement text as plan-mode skills — review-report rules bled into skills that have no review report | Neutral forward reference: "Plan-review skills include the EXIT PLAN MODE GATE at the end; this footer is a no-op for operational skills." No imposed rules where they can't apply. |
+| Regression protection | None — gate placement could silently regress on any future template edit | `bun test test/gen-skill-docs.test.ts` asserts gate is terminal `## ` heading in 4 plan-* skills (with fenced-code-block stripping) and present in codex via `toContain`. |
+
+Cross-model review by Codex (`/codex` consult mode) caught six pre-merge factual issues the eng review missed: insertion line numbers were not terminal positions, the test regex would false-match `## ` lines inside fenced code blocks, the existing `REVIEW_SKILLS` constant in the test file was missing `plan-devex-review`, the preamble retoning bled review-report rules into operational skills, gate check 4 conflicted with `PLAN_FILE_REVIEW_REPORT`'s "skip silently if no plan file" escape clause, and the implementation sequence wasn't explicit enough to prevent bisect-broken commits. All six folded in before push.
+
+### What this means for plan reviews
+
+When the model finishes a plan-* review and is about to exit plan mode, it reads a blocking checklist that reframes ExitPlanMode as a precondition-bearing call, not a free termination. The plan ships with its review report attached as the file's terminal heading, every time. If the user has been bitten by "approved a plan only to discover the review report was never written" before, that failure mode is gone.
+
+### Itemized changes
+
+#### Added
+
+- `generateExitPlanModeGate` resolver in `scripts/resolvers/review.ts:161` — emits the 4-item blocking checklist with "contract violation" framing. Single source of truth for the gate text.
+- `EXIT_PLAN_MODE_GATE` placeholder registered in `scripts/resolvers/index.ts:42`. Appended at EOF of `plan-eng-review/SKILL.md.tmpl`, `plan-ceo-review/SKILL.md.tmpl`, `plan-design-review/SKILL.md.tmpl`, `plan-devex-review/SKILL.md.tmpl`. Inserted into `codex/SKILL.md.tmpl` after `{{PLAN_FILE_REVIEW_REPORT}}` in Step 2A (mid-file by design — Step 2B/2C are not plan-touching modes).
+- `test/gen-skill-docs.test.ts:3097` — new `EXIT PLAN MODE GATE placement` describe block. Strips fenced code blocks before matching `## ` headings (a naive regex would false-match the `## GSTACK REVIEW REPORT` example inside `PLAN_FILE_REVIEW_REPORT`'s fenced markdown block). Uses a fresh skill list — not the upstream `REVIEW_SKILLS` constant which only has 3 entries and would silently miss plan-devex-review.
+
+#### Changed
+
+- `scripts/resolvers/preamble/generate-completion-status.ts:82` — `## Plan Status Footer` retoned from enforcement language ("if the plan file lacks `## GSTACK REVIEW REPORT`, run `gstack-review-read`... PLAN MODE EXCEPTION — always allowed") to neutral forward reference ("plan-review skills include the EXIT PLAN MODE GATE at the end; this footer is a no-op for operational skills"). Avoids review-report rules bleeding into `/ship`, `/qa`, `/review`, `/health`, etc.
+- `test/gen-skill-docs.test.ts:1093` — updated existing "Plan status footer in preamble" assertion to match the new neutral wording. Now also asserts the absence of "NO REVIEWS YET" to lock in the no-bleed property.
+- `test/fixtures/golden/{claude,codex,factory}-ship-SKILL.md` — golden baselines updated to capture the new preamble wording. The ship skill's body did not change; only the inherited preamble footer.
+
+#### Fixed
+
+- `package.json` build script — three `{ git rev-parse HEAD 2>/dev/null || true; }` brace groups (Bun-Windows-hostile) regressed during the v1.38.0.0 merge resolution; replaced with `( ... )` subshells to match the v1.38.0.0 invariant. Caught by Windows CI's `build-script-shell-compat` test on PR #1512.
+
+#### For contributors
+
+- The implementation sequence is load-bearing: resolver → index → templates → preamble → `bun run gen:skill-docs` → tests. Adding the test before regeneration fails on missing gate; regenerating before the resolver edits produces no-op output. Bisectable commits should respect this order.
+- The codex gate is intentionally NOT terminal in `codex/SKILL.md`. Codex has three modes (review/challenge/consult) and only review mode writes to plan files. The gate's check-2 ("last heading is GSTACK REVIEW REPORT") short-circuits cleanly when no plan file is in context, so non-plan codex invocations are unaffected.
+
 ## [1.39.0.0] - 2026-05-14
 
 ## **`buildFetchHandler` ships. Embedders compose overlay routes on top of**
