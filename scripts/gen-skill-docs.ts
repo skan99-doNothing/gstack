@@ -840,16 +840,27 @@ The orchestrator will persist the plan link to its own memory/knowledge store.
     // T4 catalog trim: write aggregated proactive-suggestions.json (Claude only).
     // The JSON registry lets agents pull voice triggers / routing prose for any
     // skill on demand instead of paying for it always-loaded in the catalog.
+    //
+    // No timestamp field — keeps the file content-deterministic across runs so
+    // CI dry-run freshness checks don't flap on regen. If a per-run timestamp
+    // is ever needed for debugging, write it to a separate `.gen-stamp` file.
     if (currentHost === 'claude' && CATALOG_MODE === 'trim' && Object.keys(proactiveAggregate).length > 0 && !DRY_RUN) {
       const proactivePath = path.join(ROOT, 'scripts', 'proactive-suggestions.json');
       const payload = {
         $schema: 'https://gstack.dev/schemas/proactive-suggestions.json',
-        generated_at: new Date().toISOString(),
         catalog_mode: 'trim',
         note: 'Routing / voice-trigger prose extracted from SKILL.md frontmatter descriptions during catalog trim. Loaded on demand when routing guidance is needed.',
         skills: proactiveAggregate,
       };
-      fs.writeFileSync(proactivePath, JSON.stringify(payload, null, 2) + '\n');
+      const serialized = JSON.stringify(payload, null, 2) + '\n';
+      // Only write if content actually changed — prevents needless touches that
+      // would flap CI freshness checks. Read existing file, compare, skip write
+      // when identical.
+      let existing = '';
+      try { existing = fs.readFileSync(proactivePath, 'utf-8'); } catch { /* first run */ }
+      if (existing !== serialized) {
+        fs.writeFileSync(proactivePath, serialized);
+      }
     }
 
     // Print token budget summary
