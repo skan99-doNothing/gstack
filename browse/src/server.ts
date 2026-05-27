@@ -2759,6 +2759,32 @@ export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
         });
       }
 
+      // GET /memory — diagnostic snapshot (auth required, does NOT reset idle).
+      // Same auth model as /activity/stream and /inspector/events: Bearer header
+      // OR view-only SSE-session cookie. Does NOT extend /health (which already
+      // leaks AUTH_TOKEN to any localhost caller in headed mode — see TODOS.md
+      // "Audit /health token distribution"); a separate endpoint with the
+      // standard SSE auth keeps the future /health fix from cascading into the
+      // sidebar footer poll.
+      if (url.pathname === '/memory' && req.method === 'GET') {
+        const cookieToken = extractSseCookie(req);
+        if (!validateAuth(req) && !validateSseSessionToken(cookieToken)) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const { buildMemorySnapshotJson } = await import('./memory-command');
+        const snapshot = await buildMemorySnapshotJson(cfgBrowserManager);
+        // sanitizeReplacer is required at every SSE/JSON egress that ships
+        // page-content-derived strings — tab.url and tab.title come from
+        // page content, so lone-surrogate bytes from broken emoji or
+        // mid-emoji splits could otherwise reach the sidebar / Claude API.
+        return new Response(JSON.stringify(snapshot, sanitizeReplacer), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
       // GET /inspector/events — SSE for inspector state changes (auth required)
       if (url.pathname === '/inspector/events' && req.method === 'GET') {
         // Same auth model as /activity/stream: Bearer OR view-only cookie.
