@@ -72,6 +72,12 @@ function runHook(stdin: object, cwd?: string): {
   }
   env.GSTACK_STATE_ROOT = stateRoot;
   delete env.GSTACK_HOME;
+  // Strip ambient Conductor markers so these cases characterize NON-Conductor
+  // behavior deterministically — otherwise running the suite inside Conductor
+  // (CONDUCTOR_WORKSPACE_PATH/PORT set) would flip every defer into the
+  // [conductor] prose deny. The Conductor cases below opt back in explicitly.
+  delete env.CONDUCTOR_WORKSPACE_PATH;
+  delete env.CONDUCTOR_PORT;
   env.GSTACK_QUESTION_LOG_NO_DERIVE = '1';
   const res = spawnSync(HOOK, [], {
     env,
